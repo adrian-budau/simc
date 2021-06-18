@@ -1622,104 +1622,109 @@ void bloodspattered_scale( special_effect_t& effect )
  */
 void shadowgrasp_totem( special_effect_t& effect )
 {
-  struct shadowgrasp_totem_damage_t : public generic_proc_t
+  struct shadowgrasp_totem_damage_t : public spell_t
   {
-    action_t* parent;
-
-    shadowgrasp_totem_damage_t( const special_effect_t& effect ) :
-      generic_proc_t( effect, "shadowgrasp_totem", 331537 ), parent( nullptr )
+    shadowgrasp_totem_damage_t( pet_t* p, const special_effect_t& effect ) :
+      spell_t( "shadowgrasp_totem", p, p->find_spell(331537) )
     {
-      dot_duration = 0_s;
-      base_dd_min = base_dd_max = player->find_spell( 329878 )->effectN( 1 ).average( effect.item );
+      base_dd_min = base_dd_max = p->find_spell( 329878 )->effectN( 1 ).average( effect.item );
     }
-
-    void init_finished() override
-    {
-      generic_proc_t::init_finished();
-      parent = player->find_action( "use_item_shadowgrasp_totem" );
-    }
-
-    // Doesn't appear to benefit from player target multipliers due to being a pet
-    // Bypass the player->composite_player_target_multiplier() call in action_t::composite_target_multiplier()
-    // We can't disable STATE_TGT_MUL_TA | STATE_TGT_MUL_DA since it benefits from Chaos Brand
-    // TODO: This should probably be fixed in some better way by changing the damage source
-    //       Pet damage modifiers appear to work on this totem, for example BM Hunter Mastery
-    double composite_target_multiplier( player_t* ) const override
-    { return composite_target_damage_vulnerability( target ); }
   };
 
-  struct shadowgrasp_totem_buff_t : public buff_t
+  struct shadowgrasp_totem_retarget_t : public spell_t
   {
-    event_t* retarget_event;
-    shadowgrasp_totem_damage_t* action;
+    pet_t* totem;
+    shadowgrasp_totem_damage_t* damage;
+
+    shadowgrasp_totem_retarget_t( pet_t* p, const special_effect_t& effect ) :
+      spell_t( "shadowgrasp_totem_retarget", p, p->find_spell( 331532 ) ),
+      totem( p ),
+      damage( new shadowgrasp_totem_damage_t( p, effect ) )
+    {}
+
+    void execute() override {
+      damage->set_target( totem->owner->target );
+      damage->execute();
+    }
+  };
+
+  struct shadowgrasp_totem_pet_t : public pet_t
+  {
+    const special_effect_t& effect;
+
+    shadowgrasp_totem_pet_t( const special_effect_t& e ) :
+      pet_t( e.player->sim, e.player, "shadowgrasp_totem", true, true ),
+      effect( e )
+    {
+    }
+
+    action_t* create_action( util::string_view name, const std::string& options ) override
+    {
+      if ( name == "shadowgrasp_totem" )
+      {
+        return new shadowgrasp_totem_retarget_t( this, effect );
+      }
+
+      return pet_t::create_action( name, options );
+    }
+
+    void init_action_list() override
+    {
+      pet_t::init_action_list();
+
+      if ( action_list_str.empty() )
+        get_action_priority_list( "default" )->add_action( "shadowgrasp_totem" );
+    }
+  };
+
+  struct shadowgrasp_totem_t : public proc_spell_t
+  {
+    spawner::pet_spawner_t<shadowgrasp_totem_pet_t> spawner;
     cooldown_t* item_cd;
     timespan_t cd_adjust;
+    player_t* source;
 
-    shadowgrasp_totem_buff_t( const special_effect_t& effect ) :
-      buff_t( effect.player, "shadowgrasp_totem", effect.player->find_spell( 331537 ) ),
-      retarget_event( nullptr ), action( new shadowgrasp_totem_damage_t( effect ) )
+    shadowgrasp_totem_t( const special_effect_t &e ) :
+      proc_spell_t( "shadowgrasp_totem", e.player, e.driver(), e.item ),
+      spawner( "shadowgrasp_totem", e.player, [ &e ]( player_t* )
+        { return new shadowgrasp_totem_pet_t( e ); } ),
+      source( e.player )
     {
-      // Periodic trigger in spell 331532 itself is hasted, which appears to control the tick rate
-      set_tick_time_behavior( buff_tick_time_behavior::HASTED );
-      set_tick_callback( [ this ]( buff_t*, int, timespan_t ) {
-        action->set_target( action->parent->target );
-        action->execute();
-      } );
+      spawner.set_default_duration( e.player->find_spell( 331537 )->duration() );
 
-      item_cd = effect.player->get_cooldown( effect.cooldown_name() );
+      item_cd = e.player->get_cooldown( e.cooldown_name() );
       cd_adjust = timespan_t::from_seconds(
-        -source->find_spell( 329878 )->effectN( 3 ).base_value() );
+        -e.player->find_spell( 329878 )->effectN( 3 ).base_value() );
 
-      range::for_each( effect.player->sim->actor_list, [ this ]( player_t* t ) {
+      range::for_each( e.player->sim->actor_list, [ this ]( player_t* t) {
         t->register_on_demise_callback( source, [ this ]( player_t* actor ) {
           trigger_target_death( actor );
         } );
       } );
     }
 
-    void reset() override
+    void execute() override
     {
-      buff_t::reset();
+      proc_spell_t::execute();
 
-      retarget_event = nullptr;
+      spawner.spawn();
     }
 
     void trigger_target_death( const player_t* actor )
     {
-      if ( !check() || !actor->is_enemy() || action->parent->target != actor )
+      auto pet = spawner.pet();
+      if ( !pet || !actor->is_enemy() || pet->parent->target != actor )
       {
         return;
       }
 
       item_cd->adjust( cd_adjust );
-
-      if ( !retarget_event && sim->shadowlands_opts.retarget_shadowgrasp_totem > 0_s )
-      {
-        retarget_event = make_event( sim, sim->shadowlands_opts.retarget_shadowgrasp_totem, [ this ]() {
-          retarget_event = nullptr;
-
-          // Retarget parent action to emulate player "retargeting" during Shadowgrasp
-          // Totem duration to grab more 15 second cooldown reductions
-          {
-            auto new_target = action->parent->select_target_if_target();
-            if ( new_target )
-            {
-              sim->print_debug( "{} action {} retargeting to a new target: {}",
-                                source->name(), action->parent->name(), new_target->name() );
-              action->parent->set_target( new_target );
-            }
-          }
-        } );
-      }
     }
+
+
   };
 
-  auto buff = buff_t::find( effect.player, "shadowgrasp_totem" );
-  if ( !buff )
-  {
-    buff = make_buff<shadowgrasp_totem_buff_t>( effect );
-    effect.custom_buff = buff;
-  }
+  effect.execute_action = create_proc_action<shadowgrasp_totem_t>( "shadowgrasp_totem", effect );
 }
 
 // TODO: Implement healing?
